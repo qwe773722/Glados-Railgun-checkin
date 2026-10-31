@@ -5,6 +5,8 @@ import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pypushdeer import PushDeer
 from logging_config import init_logger
 
@@ -23,6 +25,15 @@ class ExchangePlan(Enum):
     PLAN100 = "plan100"
     PLAN200 = "plan200"
     PLAN500 = "plan500"
+
+
+PLATFORM_UA = {
+    "Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "macOS": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "iPhone": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+}
 
 
 class APIEndpoint(Enum):
@@ -99,8 +110,8 @@ class Config:
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
 
-    """默认兑换计划"""
-    DEFAULT_EXCHANGE_PLAN = "plan500"
+    """默认兑换计划（none 表示不自动兑换）"""
+    DEFAULT_EXCHANGE_PLAN = "none"
 
     """默认是否输出详细响应"""
     DEFAULT_VERBOSE = False
@@ -144,14 +155,14 @@ class Config:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
         if not exchange_plan_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 未设置，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 未设置，将使用默认设置（不自动兑换）。")
             self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         else:
             if exchange_plan_env in self.EXCHANGE_PLANS:
                 self.exchange_plan = exchange_plan_env
                 logger.info(f"{LogEmoji.SUCCESS} 使用指定的兑换计划: {self.exchange_plan}")
             else:
-                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
+                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将跳过自动兑换。")
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
@@ -182,9 +193,20 @@ class API:
         self.domain: str = domain
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
+        self._device_ua_cache: Dict[str, str] = {}
         self.headers: Dict[str, str] = self._get_headers()
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def __del__(self):
         """关闭 session"""
@@ -211,7 +233,7 @@ class API:
         """获取请求头"""
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "user-agent": PLATFORM_UA["Windows"],
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -231,14 +253,16 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
         session_headers["cookie"] = cookies
+        if user_agent:
+            session_headers["user-agent"] = user_agent
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=json.dumps(data), timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -259,11 +283,43 @@ class API:
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到"""
+        """执行签到，含设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
-        response = self._make_request(url, "POST", checkin_data, cookies)
+        start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
+        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
 
+        if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
+            if recover_ua and recover_ua != start_ua:
+                self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
+                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
+
+        return self._parse_checkin(raw)
+
+    def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
+        """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
+        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        if not response:
+            return None
+        try:
+            raw = response.json()
+        except ValueError:
+            self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
+            return None
+
+        if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            if login_device in PLATFORM_UA:
+                self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
+        elif raw.get("code") in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
+            self._device_ua_cache["_last"] = user_agent
+
+        return raw
+
+    def _parse_checkin(self, raw: Optional[Dict]) -> Dict[str, Union[str, CheckinStatus]]:
+        """解析签到响应为结果字典"""
         result = {
             "status": "签到失败",
             "points": "0",
@@ -271,35 +327,45 @@ class API:
             "code": CheckinStatus.FAILURE,
         }
 
-        if response:
-            data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
+        if not raw:
+            result["message"] = "网络请求失败"
+            return result
 
-            if code == CheckinStatus.SUCCESS.value:
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
-                result["code"] = CheckinStatus.SUCCESS
-                result["status"] = "签到成功"
-                result["points"] = points
-                result["message"] = message
-            elif code == CheckinStatus.REPEAT.value:
-                self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.REPEAT
-                result["status"] = "重复签到"
-                result["points"] = "0"
-                result["message"] = message
-            else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
-                result["code"] = CheckinStatus.FAILURE
-                result["status"] = "签到失败"
-                result["points"] = "0"
-                result["message"] = message
+        code = raw.get("code", -2)
+        message = raw.get("message", "无消息字段")
+        points = str(raw.get("points", 0))
+
+        if code == CheckinStatus.SUCCESS.value:
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
+            result["code"] = CheckinStatus.SUCCESS
+            result["status"] = "签到成功"
+            result["points"] = points
+            result["message"] = message
+        elif code == CheckinStatus.REPEAT.value:
+            self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
+            result["code"] = CheckinStatus.REPEAT
+            result["status"] = "重复签到"
+            result["points"] = "0"
+            result["message"] = message
         else:
-            self._log("warning", LogEmoji.WARNING, "签到失败", force=True)
+            if code == 4:
+                reason = raw.get("reason")
+                if reason == "device-mismatch":
+                    login_device = raw.get("loginDevice") or "未知"
+                    if login_device in PLATFORM_UA:
+                        self._log("error", LogEmoji.ERROR, f"设备平台不匹配(loginDevice={login_device})，重试后仍失败，请确认登录设备平台", force=True)
+                    else:
+                        self._log("error", LogEmoji.ERROR, f"设备平台不匹配(loginDevice={login_device} 不在支持列表)，无法自动切换 UA；请提交相关截图到本项目 issue 以便作者更新设备列表", force=True)
+                else:
+                    self._log("error", LogEmoji.ERROR, f"服务端拒绝签到(code=4, reason={reason})，请检查账户风控状态", force=True)
+            elif code == -2:
+                self._log("error", LogEmoji.ERROR, f"无权限(code=-2)：Cookie 可能已失效，请重新登录 {self.domain} 刷新 Cookie 并更新仓库 Secret GLADOS_COOKIES 后重试", force=True)
+            else:
+                self._log("error", LogEmoji.ERROR, f"未预期响应(code={code}, message={message})，请检查 GLaDOS 服务状态或 Cookie", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
-            result["message"] = "网络请求失败"
+            result["points"] = "0"
+            result["message"] = message
 
         return result
 
@@ -473,14 +539,17 @@ class Checker:
             result.points_total = points_str
 
             # 4. 执行兑换
-            required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.EXCHANGE,
-                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-            )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
+                required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+                )
+                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            else:
+                result.exchange = "未配置兑换计划，跳过自动兑换"
 
         return result
 

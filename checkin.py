@@ -64,6 +64,13 @@ class LogEmoji:
     ERROR = "🔴"
     INFO = "ℹ️ "
 
+def _to_int_code(raw_code) -> int:
+    """将响应中的 code 字段安全转换为整数"""
+    try:
+        return int(raw_code)
+    except (TypeError, ValueError):
+        return -2
+
 
 def log_method(func):
     """日志装饰器"""
@@ -289,9 +296,11 @@ class API:
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
         raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
 
-        if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
-            login_device = raw.get("loginDevice")
-            recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
+        if raw is not None:
+            code = _to_int_code(raw.get("code", -2))
+            if code == 4 and raw.get("reason") == "device-mismatch":
+                login_device = raw.get("loginDevice")
+                recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
             if recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
                 raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
@@ -309,11 +318,12 @@ class API:
             self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
             return None
 
-        if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
-            login_device = raw.get("loginDevice")
-            if login_device in PLATFORM_UA:
-                self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
-        elif raw.get("code") in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
+        code = _to_int_code(raw.get("code", -2))
+        if code == 4 and raw.get("reason") == "device-mismatch":
+                login_device = raw.get("loginDevice")
+                if login_device in PLATFORM_UA:
+                    self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
+        elif code in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
             self._device_ua_cache["_last"] = user_agent
 
         return raw
@@ -331,7 +341,7 @@ class API:
             result["message"] = "网络请求失败"
             return result
 
-        code = raw.get("code", -2)
+        code = _to_int_code(raw.get("code", -2))
         message = raw.get("message", "无消息字段")
         points = str(raw.get("points", 0))
 
@@ -378,7 +388,7 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            code = _to_int_code(data.get("code", -2))
             left_days = data.get("data", {}).get("leftDays", None)
 
             if left_days is not None:
@@ -400,7 +410,7 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            code = _to_int_code(data.get("code", -2))
             points = data.get("points", None)
 
             if points is not None:
@@ -424,7 +434,7 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            code = _to_int_code(data.get("code", -2))
             message = data.get("message", "未知错误")
 
             if code == 0:

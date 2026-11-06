@@ -298,6 +298,7 @@ class API:
 
         if raw is not None:
             code = _to_int_code(raw.get("code", -2))
+            recover_ua = None
             if code == 4 and raw.get("reason") == "device-mismatch":
                 login_device = raw.get("loginDevice")
                 recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
@@ -541,6 +542,7 @@ class Checker:
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
+            result.points = checkin_result.get("points", "0")
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
 
             # 3. 获取积分
